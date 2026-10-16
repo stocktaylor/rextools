@@ -1,0 +1,35 @@
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 661bbb0..5f889ca 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -566,10 +573,26 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+-    REXSYS_ERROR(
+-        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+-        is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+-        rex::thread::current_thread_id());
++    // A fault the guest catches and retries (an SEH __try around a loop) repeats
++    // forever; logging each one rotates the start-up log away within a second.
++    // Log the first few of a run of identical faults, then every power of two.
++    thread_local uint32_t last_address = 0;
++    thread_local bool last_is_write = false;
++    thread_local uint64_t repeat_count = 0;
++    if (virtual_address == last_address && is_write == last_is_write) {
++      ++repeat_count;
++    } else {
++      last_address = virtual_address;
++      last_is_write = is_write;
++      repeat_count = 1;
++    }
++    if (repeat_count <= 8 || (repeat_count & (repeat_count - 1)) == 0) {
++      REXSYS_ERROR(
++          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread "
++          "0x{:X} (x{})",
++          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
++          rex::thread::current_thread_id(), repeat_count);
++    }
+     return false;
+   }
+ 

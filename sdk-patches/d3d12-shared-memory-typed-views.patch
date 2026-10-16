@@ -1,0 +1,470 @@
+diff --git a/include/rex/graphics/d3d12/shared_memory.h b/include/rex/graphics/d3d12/shared_memory.h
+index 5100818..a41e7ab 100644
+--- a/include/rex/graphics/d3d12/shared_memory.h
++++ b/include/rex/graphics/d3d12/shared_memory.h
+@@ -19,6 +19,7 @@
+ #include <rex/graphics/shared_memory.h>
+ #include <rex/memory.h>
+ #include <rex/ui/d3d12/d3d12_api.h>
++#include <rex/ui/d3d12/d3d12_provider.h>
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ 
+ namespace rex::graphics::d3d12 {
+@@ -66,8 +67,21 @@ class D3D12SharedMemory : public SharedMemory {
+     }
+   }
+ 
++  // Whether translated shaders access shared memory through R32_UINT typed
++  // buffer views instead of raw (ByteAddressBuffer) ones. Qualcomm Adreno
++  // drivers on Windows mishandle raw views larger than 256 MB (a 512 MB raw SRV
++  // returns wrong data everywhere, a raw UAV wraps at 2^28 bytes), while typed
++  // views of any size work. Must agree with the DxbcShaderTranslator option.
++  static bool ShouldUseTypedViews(const ui::d3d12::D3D12Provider& provider);
++  bool uses_typed_views() const { return typed_views_; }
++
++  // The views translated shaders bind for shared memory: raw, or R32_UINT
++  // typed if uses_typed_views().
+   void WriteRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+   void WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
++  // Null views of the same kind, for the unused one of the SRV / UAV pair.
++  void WriteNullSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
++  void WriteNullUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+   // Due to the D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP limitation, the
+   // smallest supported formats are 32-bit.
+   void WriteUintPow2SRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+@@ -92,6 +106,8 @@ class D3D12SharedMemory : public SharedMemory {
+   bool buffer_uav_writes_commit_needed_ = false;
+   void CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES new_state);
+ 
++  bool typed_views_ = false;
++
+   // Non-shader-visible buffer descriptor heap for faster binding (via copying
+   // rather than creation).
+   enum class BufferDescriptorIndex : uint32_t {
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 3b0fd61..92495a2 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -50,7 +50,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id, bool bindless_resources_used,
+                        bool edram_rov_used, bool gamma_render_target_as_unorm8 = false,
+                        bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,
+-                       uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
++                       uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false,
++                       bool shared_memory_typed_views = false);
+   ~DxbcShaderTranslator() override;
+ 
+   // Stage linkage ordering and rules (must be respected not only within the
+@@ -925,6 +926,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // Whether the output merger should be emulated in pixel shaders.
+   bool edram_rov_used_;
+ 
++  // Whether shared memory is bound as an R32_UINT typed buffer (SRV and UAV)
++  // rather than a raw one, with vertex fetch and memexport accessing it one
++  // dword at a time. Works around drivers that mishandle raw views over
++  // 256 MB (Qualcomm on Windows); see D3D12SharedMemory::ShouldUseTypedViews.
++  bool shared_memory_typed_views_;
++
+   // Whether with RTV-based output-merger, k_8_8_8_8_GAMMA render targets are
+   // stored as 8-bit with shader-side gamma conversion.
+   bool gamma_render_target_as_unorm8_;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..fe66454 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -1487,18 +1487,12 @@ bool D3D12CommandProcessor::SetupContext() {
+   if (bindless_resources_used_) {
+     // Create the system bindless descriptors once all resources are
+     // initialized.
+-    // kNullRawSRV.
+-    ui::d3d12::util::CreateBufferRawSRV(
+-        device,
+-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+-                                      uint32_t(SystemBindlessView::kNullRawSRV)),
+-        nullptr, 0);
++    // kNullRawSRV (typed if shared memory uses typed views).
++    shared_memory_->WriteNullSRVDescriptor(provider.OffsetViewDescriptor(
++        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kNullRawSRV)));
+     // kNullRawUAV.
+-    ui::d3d12::util::CreateBufferRawUAV(
+-        device,
+-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+-                                      uint32_t(SystemBindlessView::kNullRawUAV)),
+-        nullptr, 0);
++    shared_memory_->WriteNullUAVDescriptor(provider.OffsetViewDescriptor(
++        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kNullRawUAV)));
+     // kNullTexture2DArray.
+     D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc;
+     null_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+@@ -4534,7 +4528,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+       shared_memory_->WriteRawSRVDescriptor(view_cpu_handle);
+       view_cpu_handle.ptr += descriptor_size_view;
+       view_gpu_handle.ptr += descriptor_size_view;
+-      ui::d3d12::util::CreateBufferRawUAV(device, view_cpu_handle, nullptr, 0);
++      shared_memory_->WriteNullUAVDescriptor(view_cpu_handle);
+       view_cpu_handle.ptr += descriptor_size_view;
+       view_gpu_handle.ptr += descriptor_size_view;
+       if (edram_rov_used) {
+@@ -4544,7 +4538,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+       }
+       // Null SRV + UAV + EDRAM.
+       gpu_handle_shared_memory_uav_and_edram_ = view_gpu_handle;
+-      ui::d3d12::util::CreateBufferRawSRV(device, view_cpu_handle, nullptr, 0);
++      shared_memory_->WriteNullSRVDescriptor(view_cpu_handle);
+       view_cpu_handle.ptr += descriptor_size_view;
+       view_gpu_handle.ptr += descriptor_size_view;
+       shared_memory_->WriteRawUAVDescriptor(view_cpu_handle);
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 8e6b854..c7a601c 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -33,6 +33,7 @@
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/pipeline_cache.h>
+ #include <rex/graphics/d3d12/render_target_cache.h>
++#include <rex/graphics/d3d12/shared_memory.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/format/dxbc.h>
+ #include <rex/graphics/pipeline_util.h>
+@@ -99,7 +100,8 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
+       provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
+       !render_target_cache_.gamma_render_target_as_unorm16(),
+       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
+-      render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
++      render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr,
++      D3D12SharedMemory::ShouldUseTypedViews(provider));
+ 
+   if (edram_rov_used) {
+     depth_only_pixel_shader_ = std::move(shader_translator_->CreateDepthOnlyPixelShader());
+@@ -374,7 +376,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+           !render_target_cache_.gamma_render_target_as_unorm16(),
+           render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
+           render_target_cache_.draw_resolution_scale_y(),
+-          provider.GetGraphicsAnalysis() != nullptr);
++          provider.GetGraphicsAnalysis() != nullptr,
++          D3D12SharedMemory::ShouldUseTypedViews(provider));
+       // If needed and possible, create objects needed for DXIL conversion and
+       // disassembly on this thread.
+       IDxbcConverter* dxbc_converter = nullptr;
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index a5c97a0..193557d 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -25,8 +25,25 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
+                     "Use tiled shared memory on D3D12")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_shared_memory_typed_views, false, "GPU/D3D12",
++                    "Access shared memory in shaders through R32_UINT typed views instead of "
++                    "raw views (always on for Qualcomm, whose drivers break raw views over "
++                    "256 MB)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics::d3d12 {
+ 
++bool D3D12SharedMemory::ShouldUseTypedViews(const ui::d3d12::D3D12Provider& provider) {
++  if (REXCVAR_GET(d3d12_shared_memory_typed_views)) {
++    return true;
++  }
++  // DXGI reports Qualcomm as 0x5143 on some drivers and as the ACPI-style
++  // "QCOM" (0x4D4F4351) on Windows on Snapdragon.
++  uint32_t vendor_id = uint32_t(provider.GetAdapterVendorID());
++  return vendor_id == uint32_t(ui::GraphicsProvider::GpuVendorID::kQualcomm) ||
++         vendor_id == 0x4D4F4351;
++}
++
+ D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
+                                      memory::Memory& memory)
+     : SharedMemory(memory), command_processor_(command_processor) {}
+@@ -41,6 +58,11 @@ bool D3D12SharedMemory::Initialize() {
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+ 
++  typed_views_ = ShouldUseTypedViews(provider);
++  if (typed_views_) {
++    REXGPU_INFO("Shared memory: using R32_UINT typed views in shaders instead of raw views");
++  }
++
+   D3D12_RESOURCE_DESC buffer_desc;
+   ui::d3d12::util::FillBufferResourceDesc(buffer_desc, kBufferSize,
+                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+@@ -191,6 +213,10 @@ void D3D12SharedMemory::CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES
+ }
+ 
+ void D3D12SharedMemory::WriteRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
++  if (typed_views_) {
++    WriteUintPow2SRVDescriptor(handle, 2);
++    return;
++  }
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+   device->CopyDescriptorsSimple(
+@@ -201,6 +227,10 @@ void D3D12SharedMemory::WriteRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle
+ }
+ 
+ void D3D12SharedMemory::WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
++  if (typed_views_) {
++    WriteUintPow2UAVDescriptor(handle, 2);
++    return;
++  }
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+   device->CopyDescriptorsSimple(
+@@ -210,6 +240,24 @@ void D3D12SharedMemory::WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle
+       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+ }
+ 
++void D3D12SharedMemory::WriteNullSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const {
++  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
++  if (typed_views_) {
++    ui::d3d12::util::CreateBufferTypedSRV(device, handle, nullptr, DXGI_FORMAT_R32_UINT, 0);
++  } else {
++    ui::d3d12::util::CreateBufferRawSRV(device, handle, nullptr, 0);
++  }
++}
++
++void D3D12SharedMemory::WriteNullUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const {
++  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
++  if (typed_views_) {
++    ui::d3d12::util::CreateBufferTypedUAV(device, handle, nullptr, DXGI_FORMAT_R32_UINT, 0);
++  } else {
++    ui::d3d12::util::CreateBufferRawUAV(device, handle, nullptr, 0);
++  }
++}
++
+ void D3D12SharedMemory::WriteUintPow2SRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                                    uint32_t element_size_bytes_pow2) {
+   BufferDescriptorIndex descriptor_index;
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index 2c31a0e..b94fd97 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -60,12 +60,14 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
+                                            bool gamma_render_target_as_unorm8,
+                                            bool msaa_2x_supported, uint32_t draw_resolution_scale_x,
+                                            uint32_t draw_resolution_scale_y,
+-                                           bool force_emit_source_map)
++                                           bool force_emit_source_map,
++                                           bool shared_memory_typed_views)
+     : a_(shader_code_, statistics_),
+       ao_(shader_object_, statistics_),
+       vendor_id_(vendor_id),
+       bindless_resources_used_(bindless_resources_used),
+       edram_rov_used_(edram_rov_used),
++      shared_memory_typed_views_(shared_memory_typed_views),
+       gamma_render_target_as_unorm8_(gamma_render_target_as_unorm8),
+       msaa_2x_supported_(msaa_2x_supported),
+       draw_resolution_scale_x_(draw_resolution_scale_x),
+@@ -2364,8 +2366,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+       if (i == srv_index_shared_memory_) {
+         // Shared memory (when memexport isn't used in the pipeline).
+         srv.name_ptr = shared_memory_srv_name_ptr;
+-        srv.type = dxbc::RdefInputType::kByteAddress;
+-        srv.return_type = dxbc::ResourceReturnType::kMixed;
++        if (shared_memory_typed_views_) {
++          srv.type = dxbc::RdefInputType::kTexture;
++          srv.return_type = dxbc::ResourceReturnType::kUInt;
++          srv.sample_count = UINT32_MAX;
++        } else {
++          srv.type = dxbc::RdefInputType::kByteAddress;
++          srv.return_type = dxbc::ResourceReturnType::kMixed;
++        }
+         srv.dimension = dxbc::RdefDimension::kSRVBuffer;
+         srv.bind_point = uint32_t(SRVMainRegister::kSharedMemory);
+         srv.bind_count = 1;
+@@ -2432,8 +2440,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+       if (i == uav_index_shared_memory_) {
+         // Shared memory (when memexport is used in the pipeline).
+         uav.name_ptr = shared_memory_uav_name_ptr;
+-        uav.type = dxbc::RdefInputType::kUAVRWByteAddress;
+-        uav.return_type = dxbc::ResourceReturnType::kMixed;
++        if (shared_memory_typed_views_) {
++          uav.type = dxbc::RdefInputType::kUAVRWTyped;
++          uav.return_type = dxbc::ResourceReturnType::kUInt;
++          uav.sample_count = UINT32_MAX;
++        } else {
++          uav.type = dxbc::RdefInputType::kUAVRWByteAddress;
++          uav.return_type = dxbc::ResourceReturnType::kMixed;
++        }
+         uav.dimension = dxbc::RdefDimension::kUAVBuffer;
+         uav.bind_point = uint32_t(UAVRegister::kSharedMemory);
+       } else if (i == uav_index_edram_) {
+@@ -3176,11 +3190,18 @@ void DxbcShaderTranslator::WriteShaderCode() {
+   // Shader resource views, sorted by binding index.
+   for (uint32_t i = 0; i < srv_count_; ++i) {
+     if (i == srv_index_shared_memory_) {
+-      // Shared memory ByteAddressBuffer.
+-      ao_.OpDclResourceRaw(dxbc::Src::T(dxbc::Src::Dcl, srv_index_shared_memory_,
+-                                        uint32_t(SRVMainRegister::kSharedMemory),
+-                                        uint32_t(SRVMainRegister::kSharedMemory)),
+-                           uint32_t(SRVSpace::kMain));
++      dxbc::Src shared_memory_dcl(dxbc::Src::T(dxbc::Src::Dcl, srv_index_shared_memory_,
++                                               uint32_t(SRVMainRegister::kSharedMemory),
++                                               uint32_t(SRVMainRegister::kSharedMemory)));
++      if (shared_memory_typed_views_) {
++        // Shared memory Buffer<uint>.
++        ao_.OpDclResource(dxbc::ResourceDimension::kBuffer,
++                          dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
++                          shared_memory_dcl, uint32_t(SRVSpace::kMain));
++      } else {
++        // Shared memory ByteAddressBuffer.
++        ao_.OpDclResourceRaw(shared_memory_dcl, uint32_t(SRVSpace::kMain));
++      }
+     } else {
+       // Texture or texture heap.
+       dxbc::ResourceDimension texture_dimension;
+@@ -3234,13 +3255,21 @@ void DxbcShaderTranslator::WriteShaderCode() {
+   // Unordered access views, sorted by binding index.
+   for (uint32_t i = 0; i < uav_count_; ++i) {
+     if (i == uav_index_shared_memory_) {
+-      // Shared memory RWByteAddressBuffer.
+       if (!is_pixel_shader()) {
+         shader_feature_info_.feature_flags[0] |= dxbc::kShaderFeature0_UAVsAtEveryStage;
+       }
+-      ao_.OpDclUnorderedAccessViewRaw(0, dxbc::Src::U(dxbc::Src::Dcl, uav_index_shared_memory_,
+-                                                      uint32_t(UAVRegister::kSharedMemory),
+-                                                      uint32_t(UAVRegister::kSharedMemory)));
++      dxbc::Src shared_memory_dcl(dxbc::Src::U(dxbc::Src::Dcl, uav_index_shared_memory_,
++                                               uint32_t(UAVRegister::kSharedMemory),
++                                               uint32_t(UAVRegister::kSharedMemory)));
++      if (shared_memory_typed_views_) {
++        // Shared memory RWBuffer<uint>.
++        ao_.OpDclUnorderedAccessViewTyped(
++            dxbc::ResourceDimension::kBuffer, 0,
++            dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt), shared_memory_dcl);
++      } else {
++        // Shared memory RWByteAddressBuffer.
++        ao_.OpDclUnorderedAccessViewRaw(0, shared_memory_dcl);
++      }
+     } else if (i == uav_index_edram_) {
+       // EDRAM buffer R32_UINT rasterizer-ordered view.
+       shader_feature_info_.feature_flags[0] |= dxbc::kShaderFeature0_ROVs;
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index 31de175..2cc2901 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -152,6 +152,13 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+   // compromise between AMD, where there are load_dwordx2/3/4, and Nvidia, where
+   // a ByteAddressBuffer is more like an R32_UINT buffer.
+ 
++  // With typed (R32_UINT) shared memory views, address by dword index, which
++  // both the SRV and the UAV branches below start from.
++  if (shared_memory_typed_views_) {
++    a_.OpUShR(address_temp_dest, address_src, dxbc::Src::LU(2));
++    address_src = address_temp_src;
++  }
++
+   // Depending on whether the shared memory is bound as an SRV or as a UAV (if
+   // memexport is used), fetch from the appropriate binding. Extract whether
+   // shared memory is a UAV to system_temp_result_.x and check. In the `if`, put
+@@ -174,6 +181,29 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+           : dxbc::Src::T(srv_index_shared_memory_, uint32_t(SRVMainRegister::kSharedMemory)));
+     uint32_t needed_words_remaining = needed_words;
+     uint32_t word_index_previous = first_word_index;
++    if (shared_memory_typed_views_) {
++      // One typed load per dword, replicating the R32_UINT value into the
++      // word's component. The address (system_temp_result_.w) is only
++      // overwritten by the last load, word 3.
++      while (needed_words_remaining) {
++        uint32_t word_index;
++        rex::bit_scan_forward(needed_words_remaining, &word_index);
++        needed_words_remaining &= ~(uint32_t(1) << word_index);
++        if (word_index != word_index_previous) {
++          a_.OpIAdd(address_temp_dest, address_src,
++                    dxbc::Src::LU(word_index - word_index_previous));
++          address_src = address_temp_src;
++          word_index_previous = word_index;
++        }
++        dxbc::Dest word_result_dest(dxbc::Dest::R(system_temp_result_, uint32_t(1) << word_index));
++        if (i) {
++          a_.OpLdUAVTyped(word_result_dest, address_src, 1, shared_memory_src.Select(0));
++        } else {
++          a_.OpLd(word_result_dest, address_src, 0b0001, shared_memory_src.Select(0));
++        }
++      }
++      continue;
++    }
+     while (needed_words_remaining) {
+       uint32_t word_index;
+       rex::bit_scan_forward(needed_words_remaining, &word_index);
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_memexport.cpp b/src/graphics/pipeline/shader/dxbc_translator_memexport.cpp
+index e90a622..9f18a52 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_memexport.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_memexport.cpp
+@@ -685,8 +685,13 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
+       // (assuming a little-endian host).
+       a_.OpBFI(dxbc::Dest::R(sub_dword_temp, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(3),
+                eM0_address_src, dxbc::Src::LU(0));
+-      // Keep only the dword part of the address.
+-      a_.OpAnd(eM0_address_dest, eM0_address_src, dxbc::Src::LU(~uint32_t(3)));
++      // Keep only the dword part of the address (as a dword index for typed
++      // shared memory views).
++      if (shared_memory_typed_views_) {
++        a_.OpUShR(eM0_address_dest, eM0_address_src, dxbc::Src::LU(2));
++      } else {
++        a_.OpAnd(eM0_address_dest, eM0_address_src, dxbc::Src::LU(~uint32_t(3)));
++      }
+       // Erase the bits that will be replaced with eM0 via sub_dword_temp.y.
+       a_.OpBFI(dxbc::Dest::R(sub_dword_temp, 0b0010), width_src,
+                dxbc::Src::R(sub_dword_temp, dxbc::Src::kXXXX), dxbc::Src::LU(0),
+@@ -706,9 +711,15 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
+       // (assuming a little-endian host).
+       a_.OpBFI(dxbc::Dest::R(sub_dword_temp, export_eM14), dxbc::Src::LU(2), dxbc::Src::LU(3),
+                dxbc::Src::R(eM14_address_temp), dxbc::Src::LU(0));
+-      // Keep only the dword part of the address.
+-      a_.OpAnd(dxbc::Dest::R(eM14_address_temp, export_eM14), dxbc::Src::R(eM14_address_temp),
+-               dxbc::Src::LU(~uint32_t(3)));
++      // Keep only the dword part of the address (as a dword index for typed
++      // shared memory views).
++      if (shared_memory_typed_views_) {
++        a_.OpUShR(dxbc::Dest::R(eM14_address_temp, export_eM14), dxbc::Src::R(eM14_address_temp),
++                  dxbc::Src::LU(2));
++      } else {
++        a_.OpAnd(dxbc::Dest::R(eM14_address_temp, export_eM14), dxbc::Src::R(eM14_address_temp),
++                 dxbc::Src::LU(~uint32_t(3)));
++      }
+       uint32_t sub_dword_data_temp = PushSystemTemp();
+       eM14_remaining = export_eM14;
+       while (rex::bit_scan_forward(eM14_remaining, &eM14_index)) {
+@@ -745,6 +756,41 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
+     uint32_t store_mask = (uint32_t(1) << (uint32_t(1) << (i - 2))) - 1;
+     dxbc::Dest store_dest(
+         dxbc::Dest::U(uav_index_shared_memory_, uint32_t(UAVRegister::kSharedMemory), store_mask));
++    if (shared_memory_typed_views_) {
++      // R32_UINT typed view: one store per dword, addressed by dword index.
++      // Typed stores can't be write-masked, so replicate each dword. The
++      // addresses are modified in place - only one case runs.
++      uint32_t dword_count = uint32_t(1) << (i - 2);
++      dxbc::Dest typed_store_dest(
++          dxbc::Dest::U(uav_index_shared_memory_, uint32_t(UAVRegister::kSharedMemory), 0b1111));
++      auto store_typed = [&](const dxbc::Dest& address_dest, const dxbc::Src& address_src,
++                             uint32_t data_temp) {
++        a_.OpUShR(address_dest, address_src, dxbc::Src::LU(2));
++        for (uint32_t j = 0; j < dword_count; ++j) {
++          if (j) {
++            a_.OpIAdd(address_dest, address_src, dxbc::Src::LU(1));
++          }
++          a_.OpStoreUAVTyped(typed_store_dest, address_src, 1,
++                             dxbc::Src::R(data_temp).Select(j));
++        }
++      };
++      if (export_eM & 0b1) {
++        a_.OpIf(true, eM0_written_src);
++        store_typed(eM0_address_dest, eM0_address_src, system_temps_memexport_data_[0]);
++        a_.OpEndIf();
++      }
++      eM14_remaining = export_eM14;
++      while (rex::bit_scan_forward(eM14_remaining, &eM14_index)) {
++        eM14_remaining &= ~(uint8_t(1) << eM14_index);
++        a_.OpIf(true, dxbc::Src::R(store_eM14_temp).Select(eM14_index));
++        store_typed(dxbc::Dest::R(eM14_address_temp, uint32_t(1) << eM14_index),
++                    dxbc::Src::R(eM14_address_temp).Select(eM14_index),
++                    system_temps_memexport_data_[1 + eM14_index]);
++        a_.OpEndIf();
++      }
++      a_.OpBreak();
++      continue;
++    }
+     if (export_eM & 0b1) {
+       a_.OpIf(true, eM0_written_src);
+       a_.OpStoreRaw(store_dest, eM0_address_src, dxbc::Src::R(system_temps_memexport_data_[0]));

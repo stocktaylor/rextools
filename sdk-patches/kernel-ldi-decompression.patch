@@ -1,0 +1,285 @@
+diff --git a/include/rex/system/lzx.h b/include/rex/system/lzx.h
+index a310bad..0c81cbb 100644
+--- a/include/rex/system/lzx.h
++++ b/include/rex/system/lzx.h
+@@ -24,3 +24,15 @@ int lzx_decompress(const void* lzx_data, size_t lzx_len, void* dest, size_t dest
+ 
+ int lzxdelta_apply_patch(rex::xex2_delta_patch* patch, size_t patch_len, uint32_t window_size,
+                          void* dest);
++
++// Streaming LZX decoder for the kernel LDI* API (LDICreateDecompression etc.):
++// one context per stream, fed one compressed block per call, each block
++// decompressing to one frame (32 KB, or less for the final frame). The window
++// and Huffman state persist across calls.
++struct lzx_stream_ctx;
++lzx_stream_ctx* lzx_stream_create(uint32_t window_size);
++// Decompresses one block into exactly dst_len bytes. Returns 0 on success.
++int lzx_stream_decompress(lzx_stream_ctx* ctx, const void* src, size_t src_len, void* dst,
++                          size_t dst_len);
++int lzx_stream_reset(lzx_stream_ctx* ctx);
++void lzx_stream_destroy(lzx_stream_ctx* ctx);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_modules.cpp b/src/kernel/xboxkrnl/xboxkrnl_modules.cpp
+index dcd2001..2871cfa 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_modules.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_modules.cpp
+@@ -9,12 +9,16 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <mutex>
++#include <unordered_map>
++
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+ #include <rex/hook.h>
+ #include <rex/thread/mutex.h>
+ #include <rex/types.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/lzx.h>
+ #include <rex/system/user_module.h>
+ #include <rex/system/xexception.h>
+ #include <rex/system/xthread.h>
+@@ -214,6 +218,102 @@ u32 XexLoadImageHeaders_entry(mapped_string path, mapped_void headers) {
+   return X_STATUS_NOT_IMPLEMENTED;
+ }
+ 
++// LDI: the CAB-era LZX decompression interface (MDI_ERROR_* results). Titles
++// that ship XMemCompress'd data call it directly; London 2012's Kinect runtime
++// unpacks its model database with it and fails to start without it.
++namespace {
++constexpr u32 kMdiErrorNone = 0;
++constexpr u32 kMdiErrorNotEnoughMemory = 1;
++constexpr u32 kMdiErrorBadParameters = 2;
++constexpr u32 kMdiErrorFailed = 4;
++// LZX worst-case expansion of a block, as in the CAB SDK.
++constexpr u32 kLzxMaxGrowth = 6144;
++
++std::mutex ldi_mutex;
++std::unordered_map<u32, lzx_stream_ctx*> ldi_contexts;
++u32 ldi_next_handle = 1;
++
++lzx_stream_ctx* LdiLookup(u32 handle) {
++  std::lock_guard lock(ldi_mutex);
++  auto it = ldi_contexts.find(handle);
++  return it == ldi_contexts.end() ? nullptr : it->second;
++}
++}  // namespace
++
++u32 LDICreateDecompression_entry(mapped_u32 data_block_max_ptr, mapped_void configuration,
++                                 u32 alloc_fn, u32 free_fn, u32 workspace,
++                                 mapped_u32 src_buffer_min_ptr, mapped_u32 handle_ptr) {
++  // configuration: LZXDECOMPRESS { be<s32> WindowSize; be<s32> fCPUtype; }
++  // The 360 variant takes a caller-supplied workspace (r7) before the CAB
++  // SDK's out-params; the handle is the 7th argument (London 2012 reads it
++  // back from there).
++  if (!data_block_max_ptr || !configuration || !handle_ptr) {
++    return kMdiErrorBadParameters;
++  }
++  uint32_t window_size = configuration.as<rex::be<uint32_t>*>()[0];
++  auto ctx = lzx_stream_create(window_size);
++  if (!ctx) {
++    REXKRNL_WARN("LDICreateDecompression: unsupported window size {:#x}", window_size);
++    return kMdiErrorNotEnoughMemory;
++  }
++  if (src_buffer_min_ptr) {
++    *src_buffer_min_ptr = uint32_t(*data_block_max_ptr) + kLzxMaxGrowth;
++  }
++  u32 handle;
++  {
++    std::lock_guard lock(ldi_mutex);
++    handle = ldi_next_handle++;
++    ldi_contexts[handle] = ctx;
++  }
++  *handle_ptr = handle;
++  REXKRNL_DEBUG("LDICreateDecompression(block max {:#x}, window {:#x}) -> handle {}",
++                uint32_t(*data_block_max_ptr), window_size, handle);
++  return kMdiErrorNone;
++}
++
++u32 LDIDecompress_entry(u32 handle, mapped_void src, u32 src_size, mapped_void dst,
++                        mapped_u32 dst_size_ptr) {
++  // *dst_size_ptr: in = bytes this block decompresses to, out = bytes written.
++  auto ctx = LdiLookup(handle);
++  if (!ctx || !src || !dst || !dst_size_ptr) {
++    REXKRNL_WARN("LDIDecompress: bad parameters (handle {:#x})", (uint32_t)handle);
++    return kMdiErrorBadParameters;
++  }
++  uint32_t dst_size = *dst_size_ptr;
++  if (lzx_stream_decompress(ctx, src.as<uint8_t*>(), src_size, dst.as<uint8_t*>(), dst_size)) {
++    REXKRNL_WARN("LDIDecompress(handle {}, {:#x} -> {:#x} bytes) failed", (uint32_t)handle,
++                 (uint32_t)src_size, dst_size);
++    *dst_size_ptr = 0;
++    return kMdiErrorFailed;
++  }
++  REXKRNL_DEBUG("LDIDecompress(handle {}, {:#x} -> {:#x} bytes)", (uint32_t)handle,
++                (uint32_t)src_size, dst_size);
++  return kMdiErrorNone;
++}
++
++u32 LDIResetDecompression_entry(u32 handle) {
++  auto ctx = LdiLookup(handle);
++  if (!ctx) {
++    return kMdiErrorBadParameters;
++  }
++  return lzx_stream_reset(ctx) ? kMdiErrorNotEnoughMemory : kMdiErrorNone;
++}
++
++u32 LDIDestroyDecompression_entry(u32 handle) {
++  lzx_stream_ctx* ctx = nullptr;
++  {
++    std::lock_guard lock(ldi_mutex);
++    auto it = ldi_contexts.find(handle);
++    if (it == ldi_contexts.end()) {
++      return kMdiErrorBadParameters;
++    }
++    ctx = it->second;
++    ldi_contexts.erase(it);
++  }
++  lzx_stream_destroy(ctx);
++  return kMdiErrorNone;
++}
++
+ }  // namespace rex::kernel::xboxkrnl
+ 
+ REX_EXPORT(__imp__XexCheckExecutablePrivilege,
+@@ -226,6 +326,10 @@ REX_EXPORT(__imp__XexGetProcedureAddress, rex::kernel::xboxkrnl::XexGetProcedure
+ REX_EXPORT(__imp__ExRegisterTitleTerminateNotification,
+            rex::kernel::xboxkrnl::ExRegisterTitleTerminateNotification_entry)
+ REX_EXPORT(__imp__XexLoadImageHeaders, rex::kernel::xboxkrnl::XexLoadImageHeaders_entry)
++REX_EXPORT(__imp__LDICreateDecompression, rex::kernel::xboxkrnl::LDICreateDecompression_entry)
++REX_EXPORT(__imp__LDIDecompress, rex::kernel::xboxkrnl::LDIDecompress_entry)
++REX_EXPORT(__imp__LDIDestroyDecompression, rex::kernel::xboxkrnl::LDIDestroyDecompression_entry)
++REX_EXPORT(__imp__LDIResetDecompression, rex::kernel::xboxkrnl::LDIResetDecompression_entry)
+ 
+ REX_EXPORT_STUB(__imp__XexLoadExecutable);
+ REX_EXPORT_STUB(__imp__XexLoadImageFromMemory);
+@@ -258,7 +362,3 @@ REX_EXPORT_STUB(__imp__XexTitleHashOpen);
+ REX_EXPORT_STUB(__imp__XexReserveCodeBuffer);
+ REX_EXPORT_STUB(__imp__XexCommitCodeBuffer);
+ REX_EXPORT_STUB(__imp__XexRegisterUsermodeModule);
+-REX_EXPORT_STUB(__imp__LDICreateDecompression);
+-REX_EXPORT_STUB(__imp__LDIDecompress);
+-REX_EXPORT_STUB(__imp__LDIDestroyDecompression);
+-REX_EXPORT_STUB(__imp__LDIResetDecompression);
+diff --git a/src/system/lzx.cpp b/src/system/lzx.cpp
+index 6279aa9..5f99d12 100644
+--- a/src/system/lzx.cpp
++++ b/src/system/lzx.cpp
+@@ -147,6 +147,117 @@ int lzx_decompress(const void* lzx_data, size_t lzx_len, void* dest, size_t dest
+   return result_code;
+ }
+ 
++struct lzx_stream_ctx {
++  mspack_system* sys = nullptr;
++  mspack_memory_file* src = nullptr;
++  mspack_memory_file* dst = nullptr;
++  lzxd_stream* lzxd = nullptr;
++  uint32_t window_bits = 0;
++};
++
++// Source reads past the end of the current block return zeros: the decoder
++// reads ahead a few bytes at frame ends, and an empty read would latch its
++// end-of-input error for the rest of the stream.
++static int lzx_stream_read(mspack_file* file, void* buffer, int chars) {
++  auto memfile = (mspack_memory_file*)file;
++  const off_t remaining = memfile->buffer_size - memfile->offset;
++  if (remaining <= 0) {
++    std::memset(buffer, 0, chars);
++    return chars;
++  }
++  return mspack_memory_read(file, buffer, chars);
++}
++
++lzx_stream_ctx* lzx_stream_create(uint32_t window_size) {
++  uint32_t window_bits;
++  if (!rex::bit_scan_forward(window_size, &window_bits)) {
++    return nullptr;
++  }
++  auto ctx = new lzx_stream_ctx();
++  ctx->window_bits = window_bits;
++  ctx->sys = mspack_memory_sys_create();
++  if (ctx->sys) {
++    ctx->sys->read = lzx_stream_read;
++    ctx->src = mspack_memory_open(ctx->sys, nullptr, 0);
++    ctx->dst = mspack_memory_open(ctx->sys, nullptr, 0);
++  }
++  if (!ctx->src || !ctx->dst || lzx_stream_reset(ctx) != 0) {
++    lzx_stream_destroy(ctx);
++    return nullptr;
++  }
++  return ctx;
++}
++
++int lzx_stream_reset(lzx_stream_ctx* ctx) {
++  if (ctx->lzxd) {
++    lzxd_free(ctx->lzxd);
++  }
++  ctx->lzxd = lzxd_init(ctx->sys, (mspack_file*)ctx->src, (mspack_file*)ctx->dst,
++                        ctx->window_bits, 0, 0x10000, 0, 0);
++  return ctx->lzxd ? 0 : 1;
++}
++
++int lzx_stream_decompress(lzx_stream_ctx* ctx, const void* src, size_t src_len, void* dst,
++                          size_t dst_len) {
++  auto lzx = ctx->lzxd;
++  if (!lzx) {
++    return 1;
++  }
++  if (!dst_len) {
++    return 0;
++  }
++  ctx->src->buffer = const_cast<void*>(src);
++  ctx->src->buffer_size = (off_t)src_len;
++  ctx->src->offset = 0;
++  ctx->dst->buffer = dst;
++  ctx->dst->buffer_size = (off_t)dst_len;
++  ctx->dst->offset = 0;
++
++  // Each call carries one block: drop whatever the decoder read ahead past the
++  // previous one (frames end 16-bit aligned, so nothing real is lost).
++  lzx->i_ptr = lzx->i_end = lzx->inbuf;
++  lzx->bit_buffer = 0;
++  lzx->bits_left = 0;
++  lzx->input_end = 0;
++  // A block shorter than a frame is the final frame; its size comes from the
++  // stream length.
++  lzx->length = lzx->offset + (off_t)dst_len;
++
++  // lzxd_decompress(n) decodes through frame (offset + n) / 32K, i.e. one
++  // frame too many when n ends exactly on a frame boundary, and that frame's
++  // input isn't here yet. Decode n - 1 bytes, then flush the last one.
++  int result = MSPACK_ERR_OK;
++  if (dst_len > 1) {
++    result = lzxd_decompress(lzx, (off_t)dst_len - 1);
++  }
++  if (result == MSPACK_ERR_OK) {
++    result = lzxd_decompress(lzx, 1);
++  }
++  if (result != MSPACK_ERR_OK || ctx->dst->offset != (off_t)dst_len) {
++    return result ? result : 1;
++  }
++  return 0;
++}
++
++void lzx_stream_destroy(lzx_stream_ctx* ctx) {
++  if (!ctx) {
++    return;
++  }
++  if (ctx->lzxd) {
++    lzxd_free(ctx->lzxd);
++  }
++  if (ctx->src) {
++    mspack_memory_close(ctx->src);
++  }
++  if (ctx->dst) {
++    mspack_memory_close(ctx->dst);
++  }
++  if (ctx->sys) {
++    mspack_memory_sys_destroy(ctx->sys);
++  }
++  delete ctx;
++}
++
+ int lzxdelta_apply_patch(rex::xex2_delta_patch* patch, size_t patch_len, uint32_t window_size,
+                          void* dest) {
+   void* patch_end = (char*)patch + patch_len;

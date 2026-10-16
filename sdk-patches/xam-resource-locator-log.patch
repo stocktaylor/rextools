@@ -1,0 +1,18 @@
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..2560fe3 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -107,11 +109,11 @@ u32 keXamBuildResourceLocator(uint64_t module, std::u16string_view container,
+   std::u16string path;
+   if (!module) {
+     path = fmt::format(u"file://media:/{}.xzp#{}", container, resource);
+-    REXKRNL_DEBUG("XamBuildResourceLocator({0}) returning locator to local file {0}.xzp",
+-                  rex::string::to_utf8(container));
+   } else {
+     path = fmt::format(u"section://{:X},{}#{}", (uint32_t)module, container, resource);
+   }
++  REXKRNL_DEBUG("XamBuildResourceLocator({}) -> '{}' (buffer {} chars)",
++                rex::string::to_utf8(container), rex::string::to_utf8(path), buffer_count);
+   rex::string::copy_and_swap_truncating(buffer_ptr.as<char16_t*>(), path, buffer_count);
+   return 0;
+ }

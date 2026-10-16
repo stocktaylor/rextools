@@ -1,0 +1,65 @@
+diff --git a/include/rex/codegen/function_scanner.h b/include/rex/codegen/function_scanner.h
+index d5a3654..4ab62a3 100644
+--- a/include/rex/codegen/function_scanner.h
++++ b/include/rex/codegen/function_scanner.h
+@@ -256,7 +256,8 @@ struct BlockDiscoveryResult {
+ BlockDiscoveryResult discoverBlocks(
+     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize = 0,
+-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr);
++    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr,
++    const std::unordered_set<uint32_t>* knownIndirectCalls = nullptr);
+ 
+ //=============================================================================
+ // Jump Table Detection
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index fc918bb..59dcf12 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -534,7 +534,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+           REXCODEGEN_WARN("Unable to decode instruction {:X} at {:X}", *data, blockBase);
+       } else {
+         // Late jump table detection for bctr
+-        if (insn.opcode->id == PPC_INST_BCTR && !activeJt) {
++        if (insn.opcode->id == PPC_INST_BCTR && !activeJt &&
++            !ctx.config.knownIndirectCallHints.count(blockBase)) {
+           bool is_switch_pattern = false;
+           constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
+           constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
+diff --git a/src/codegen/function_scanner.cpp b/src/codegen/function_scanner.cpp
+index d7ba519..7097a8a 100644
+--- a/src/codegen/function_scanner.cpp
++++ b/src/codegen/function_scanner.cpp
+@@ -1815,7 +1815,8 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
+ BlockDiscoveryResult discoverBlocks(
+     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
+-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
++    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables,
++    const std::unordered_set<uint32_t>* knownIndirectCalls) {
+   BlockDiscoveryResult result;
+   std::unordered_set<uint32_t> visited;
+   std::unordered_set<uint32_t> blockStarts;
+@@ -1934,7 +1935,8 @@ BlockDiscoveryResult discoverBlocks(
+                   jt->targets.size());
+             }
+           }
+-          if (!jt) {
++          // A bctr listed in indirect_calls is a computed call, never a switch.
++          if (!jt && !(knownIndirectCalls && knownIndirectCalls->count(addr))) {
+             jt = detectJumpTable(decoded, addr, containingRegion, entryPoint, funcEnd);
+           }
+           if (jt) {
+diff --git a/src/codegen/phase_discover.cpp b/src/codegen/phase_discover.cpp
+index 1c73548..78a291e 100644
+--- a/src/codegen/phase_discover.cpp
++++ b/src/codegen/phase_discover.cpp
+@@ -96,7 +96,7 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
+ 
+   // Pass pdataSize so forward branches within function extent are correctly identified
+   auto result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize,
+-                               &ctx.Config().switchTables);
++                               &ctx.Config().switchTables, &ctx.Config().knownIndirectCallHints);
+ 
+   if (result.blocks.empty()) {
+     REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);

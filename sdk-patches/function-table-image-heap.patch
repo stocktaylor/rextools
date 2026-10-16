@@ -1,0 +1,32 @@
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 661bbb0..f11bc69 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -818,7 +825,15 @@ bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uin
+       "(+{:08X} thunk reserve)",
+       table_base, table_size, code_base, code_base + code_size, kThunkReserveSize);
+ 
+-  if (!heaps_.v80000000.AllocFixed(
++  // The table follows the image, so it lives in whichever XEX heap holds the
++  // image: 0x80000000 for titles, 0x90000000 for system images (dash.xex).
++  BaseHeap* heap = LookupHeap(table_base);
++  if (!heap || heap != LookupHeap(table_base + table_size - 1)) {
++    REXSYS_ERROR("Function table {:08X}-{:08X} does not fit in one heap", table_base,
++                 table_base + table_size);
++    return false;
++  }
++  if (!heap->AllocFixed(
+           table_base, table_size, 0x10000,
+           memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+           memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+@@ -862,7 +877,9 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
+   REXSYS_DEBUG("Destroying function table at {:08X}, size {:08X} for code {:08X}-{:08X}",
+                table_base, table_size, logged_code_base, logged_code_base + logged_code_size);
+ 
+-  heaps_.v80000000.Release(table_base);
++  if (BaseHeap* heap = LookupHeap(table_base)) {
++    heap->Release(table_base);
++  }
+   return true;
+ }
+ 

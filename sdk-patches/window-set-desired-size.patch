@@ -1,0 +1,89 @@
+diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
+index f607be2..5c23185 100644
+--- a/include/rex/ui/window.h
++++ b/include/rex/ui/window.h
+@@ -259,6 +259,9 @@ class Window {
+   // user resizes a non-maximized window.
+   uint32_t GetDesiredLogicalWidth() const { return desired_logical_width_; }
+   uint32_t GetDesiredLogicalHeight() const { return desired_logical_height_; }
++  // Resizes the window (when not fullscreen; a fullscreen window takes the new
++  // size when it leaves fullscreen).
++  void SetDesiredLogicalSize(uint32_t new_width, uint32_t new_height);
+ 
+   // 0 width or height may be returned even in case of an open window with a
+   // valid non-zero-area surface depending on the platform.
+@@ -514,6 +517,7 @@ class Window {
+   // ApplyNew* means that the value has actually been changed to something
+   // different than it was previously.
+   virtual void ApplyNewFullscreen() {}
++  virtual void ApplyNewDesiredLogicalSize() {}
+   virtual void ApplyNewTitle() {}
+   // can_apply_state_in_current_phase whether the window is in a life cycle
+   // phase that would normally accept Apply calls (the native window surely
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 71e7473..4e12a4b 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -50,6 +50,7 @@ class WindowSDL final : public Window {
+   void RequestCloseImpl() override;
+ 
+   void ApplyNewFullscreen() override;
++  void ApplyNewDesiredLogicalSize() override;
+   void ApplyNewTitle() override;
+   void ApplyNewMouseCapture() override;
+   void ApplyNewMouseRelease() override;
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index b4e045f..613790c 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -287,6 +287,23 @@ void Window::SetFullscreen(bool new_fullscreen) {
+   }
+ }
+ 
++void Window::SetDesiredLogicalSize(uint32_t new_width, uint32_t new_height) {
++  if (!new_width || !new_height ||
++      (desired_logical_width_ == new_width && desired_logical_height_ == new_height)) {
++    return;
++  }
++  desired_logical_width_ = new_width;
++  desired_logical_height_ = new_height;
++  if (!CanApplyState()) {
++    return;
++  }
++  WindowDestructionReceiver destruction_receiver(this);
++  ApplyNewDesiredLogicalSize();
++  if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
++    return;
++  }
++}
++
+ void Window::SetTitle(const std::string_view new_title) {
+   if (title_ == new_title) {
+     return;
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..e91cf2c 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -298,6 +298,22 @@ void WindowSDL::ApplyNewFullscreen() {
+   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
+ }
+ 
++void WindowSDL::ApplyNewDesiredLogicalSize() {
++  if (!sdl_window_) {
++    return;
++  }
++  // Same coordinate convention as OpenImpl. SDL keeps the size for when a
++  // fullscreen window returns to windowed.
++#if REX_PLATFORM_MAC
++  int width = int(GetDesiredLogicalWidth());
++  int height = int(GetDesiredLogicalHeight());
++#else
++  int width = int(SizeToPhysical(GetDesiredLogicalWidth()));
++  int height = int(SizeToPhysical(GetDesiredLogicalHeight()));
++#endif
++  SDL_SetWindowSize(sdl_window_, width, height);
++}
++
+ void WindowSDL::ApplyNewTitle() {
+   if (!sdl_window_) {
+     return;
