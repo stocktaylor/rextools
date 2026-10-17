@@ -9,7 +9,9 @@ Every command finds the project from the current directory (the nearest
 
 ## Setup
 
-Put `rex` on your PATH permanently:
+Put the rextools folder on your PATH permanently.
+
+Linux:
 
 ```bash
 echo 'export PATH="/home/tstock/Source/Xenia Recomps/rextools:$PATH"' >> ~/.bashrc
@@ -17,29 +19,34 @@ source ~/.bashrc
 cd Ridge && rex help
 ```
 
+Windows (PowerShell; open a new terminal afterwards):
+
+```powershell
+[Environment]::SetEnvironmentVariable("Path", "C:\path\to\rextools;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
+```
+
 rextools expects the rexglue SDK checkout next to it (`../rexglue-sdk`), built
 and installed. Point `REXGLUE_SDK` elsewhere if it isn't there.
 
 ## Dependencies
 
-Linux only for now. Everything is bash plus Python scripts that use only the
-standard library, so there's nothing to `pip install`. One Fedora command
-covers it all:
+The commands are Python (standard library only, so there's nothing to
+`pip install`) in `py/rex.py` and `py/rexcli/`. `rex` (Linux) and `rex.cmd`
+(Windows: PowerShell or cmd) are small shims that start it. Linux is the
+primary platform; Windows runs most commands (see [Windows](#windows) below).
+One Fedora command covers everything:
 
 ```bash
-sudo dnf install python3 cmake ninja-build clang git gdb binutils perf renderdoc podman \
-                 systemd procps-ng diffutils grep findutils coreutils gawk sed
+sudo dnf install python3 cmake ninja-build clang git gdb binutils perf renderdoc podman systemd
 ```
 
 | Needed for | Tools | Notes |
 |---|---|---|
-| Everything | bash, Python **3.11+**, GNU coreutils / sed / awk / findutils | Python 3.11 for `tomllib` (manifest parsing). GNU `find -printf` and `stat -c` are used for logs and captures |
+| Everything | Python **3.11+** | 3.11 for `tomllib` (manifest parsing) |
 | `rex new`, `rex build`, `rex triage` | CMake ≥ 3.25, Ninja, clang/clang++, git | What the SDK's generated presets use. `rex new` also needs the SDK's `rexglue` CLI installed |
-| `rex triage` | GNU grep with PCRE (`grep -P`) | Reads the unregistered-function address from the log |
 | `rex crash` | gdb, `coredumpctl` (systemd-coredump) | Core dumps must be collected by systemd-coredump (Fedora default) |
-| `rex hang`, `rex hang --samples` | gdb, pgrep (procps) | Needs ptrace permission: `kernel.yama.ptrace_scope=0` or `sudo` |
+| `rex hang`, `rex hang --samples`, `rex peek` | gdb | Needs ptrace permission: `kernel.yama.ptrace_scope=0` or `sudo` |
 | `rex pc2func` | `nm` (binutils) | |
-| `rex run`, `rex build` (plugin sync) | `cmp` (diffutils) | |
 | `rex run --renderdoc`, `rex rdc dump` | RenderDoc (`renderdoccmd`, `qrenderdoc`; tested with 1.45) | Fedora's package has no standalone Python module; `rdc dump` runs inside `qrenderdoc --python`. `rdc align`/`diff`/`list` need only Python |
 | Performance work | `perf` | Not called by `rex`; see the `perf` commands under Notes |
 | `rex sdk ...` | git | The SDK must be a git checkout (patch status / apply / export) |
@@ -47,6 +54,41 @@ sudo dnf install python3 cmake ninja-build clang git gdb binutils perf renderdoc
 
 Not needed: Pillow, a standalone `renderdoc` Python module, `bc`, or any
 Python packages. `py/pngcrop.py` covers cropping PNGs without PIL.
+
+### Windows
+
+Run `rex` from PowerShell or cmd (`rex.cmd` is picked up from PATH). Needed:
+Python 3.11+ (the `py` launcher is preferred, so the Microsoft Store
+`python3` placeholder doesn't matter), CMake, Ninja, and LLVM (clang). Tested
+on Windows 11 ARM64 (Snapdragon X, Adreno X1-85) with the native `win-arm64`
+presets.
+
+Handled automatically:
+
+- **Preset**: `win-arm64-relwithdebinfo` or `win-amd64-relwithdebinfo` from the
+  native CPU (via `IsWow64Process2`, so an emulated x64 Python on ARM64 still
+  picks arm64). `REX_PRESET` still overrides.
+- **SDK layout**: `out/install/<platform>/bin/*.dll` instead of `lib64/*.so`;
+  game binaries are `<name>.exe`. `rex build`/`rex run` refresh both the GPU
+  plugin and the runtime DLL next to the game, since Windows loads them from there.
+- **clang**: `C:\Program Files\LLVM\bin` is put on PATH if clang isn't already.
+- `rex run` drops the Vulkan present-mode flags (Windows renders with D3D12)
+  and waits for the game, returning its exit code.
+- `rex triage` reports a crash by its exception code (e.g. `0xC0000005
+  (access violation)`); there's no post-mortem on Windows yet.
+- `rex clean-shm` is a no-op: guest memory is a pagefile-backed mapping freed
+  at exit.
+
+Works: `new`, `build`, `run`, `triage`, `log`, `lint`, `funcs`/`asm`,
+`callers`, `containing`, `modules`, `sdk`, `rdc list`. `rdc align`/`diff`
+are pure Python and should work, but are untested on Windows (no RenderDoc
+captures yet). PowerShell 5.1 shows anything `rex` prints to stderr (the
+`rex: ...` notes) in red as a `NativeCommandError` when redirected; that's
+cosmetic.
+
+Not on Windows yet: `crash`, `hang`, `peek` (gdb / coredumpctl), `pc2func`
+(reads ELF symbols with `nm`; Windows binaries carry PDBs) and `dist` (Linux
+container). They stop with a message saying so.
 
 ## Typical bring-up of a new game
 
@@ -285,10 +327,11 @@ Roughly in priority order.
    names those frames).
 10. **Upstream the SDK patches** (all three are general rexglue bugs) and
     drop each from `sdk-patches/` once it's in a release.
-11. **Portability.** Windows support (PowerShell, or Python-only commands),
-    and macOS paths for the SDK install.
-12. **Version control for rextools itself** (`git init`; `.gitignore`
-    already ignores `__pycache__`).
+11. **Portability.** The commands are Python and run natively on Windows
+    (PowerShell / cmd) for build/run/inspect (see [Windows](#windows)). Still to do there: `crash` (WER
+    minidumps + cdb), `hang`/`peek` (cdb, or small DbgHelp helpers), `pc2func`
+    (PDB symbols via `llvm-symbolizer`), and Windows packaging for `dist`.
+    macOS paths for the SDK install are also missing.
 
 ## Notes
 
