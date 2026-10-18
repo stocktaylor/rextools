@@ -2,7 +2,8 @@
 recompilation projects. Run from anywhere inside a project directory.
 
   rex new <name> <xex> [--game-root DIR]   bootstrap a new project here
-  rex build [--force-codegen]              codegen -> configure -> build -> lint
+  rex build [--force-codegen] [-DNAME=VAL] codegen -> configure -> build -> lint;
+                                           -D options go to CMake (cached)
   rex run [game args...]                   run the game with standard flags
   rex run --renderdoc [game args...]       run under RenderDoc (F12 captures a frame)
   rex triage [timeout] [--hang-dump]       build/run loop: auto-add missing

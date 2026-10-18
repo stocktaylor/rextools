@@ -105,7 +105,7 @@ rex triage 120 --hang-dump         # if it then shows a black screen / stalls
 | Command | What it does |
 |---|---|
 | `rex new <name> <xex> [--game-root D]` | `rexglue init` in `$PWD` plus the fixes init leaves out (see below) |
-| `rex build [--force-codegen]` | configure (first time) → codegen → configure → build → lint |
+| `rex build [--force-codegen] [-DNAME=VALUE...]` | configure (first time) → codegen → configure → build → lint. `-D` options (also `-D NAME=VALUE`) go to every CMake configure, e.g. `rex build -DBLADE_LAUNCHER=OFF`; CMake caches them, so later builds keep the value until you pass another |
 | `rex run [args]` | runs with the SDK libs, `--gpu_plugin xenos`, info logging, 1s log flush |
 | `rex triage [secs] [--hang-dump] [--no-build]` | build/run loop: auto-adds unregistered-function addresses, post-mortems crashes, optionally dumps stacks at the timeout |
 | `rex lint [--all]` | scans generated code for jump tables that are really computed calls |

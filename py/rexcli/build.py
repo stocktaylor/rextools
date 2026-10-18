@@ -104,7 +104,10 @@ Project '{name}' created. Next:
 
 
 # --------------------------------------------------------------------------
-# rex build [--force-codegen]
+# rex build [--force-codegen] [-DNAME=VALUE...]
+# -D options go to every CMake configure step, e.g. a project option like
+# `rex build -DBLADE_LAUNCHER=OFF`. CMake caches them, so later builds keep
+# the value until you pass a different one.
 # codegen -> configure -> build -> lint, in the order rexglue needs:
 #  - the <name>_codegen target only exists once the build dir is configured,
 #  - generated/<mod>/sources.cmake is only picked up at configure time, so a
@@ -115,11 +118,20 @@ Project '{name}' created. Next:
 def cmd_build(args: list[str]) -> int:
     ctx = load_project()
     force = False
-    for a in args:
+    cmake_defs = []
+    i = 0
+    while i < len(args):
+        a = args[i]
         if a == "--force-codegen":
             force = True
+        elif a == "-D" and i + 1 < len(args):
+            cmake_defs.append(f"-D{args[i + 1]}")
+            i += 1
+        elif a.startswith("-D") and len(a) > 2:
+            cmake_defs.append(a)
         else:
             die(f"build: unknown option '{a}'")
+        i += 1
 
     stamp = ctx.gen_dir / "codegen.stamp"
     codegen_lib = SDK_LIB / sdk_lib_file("rexruntime", "")  # the rexglue CLI links the Release runtime
@@ -137,11 +149,15 @@ def cmd_build(args: list[str]) -> int:
         note("warning: CMakeLists.txt has no GPU_PLUGINS (rexglue_setup_target(... GPU_PLUGINS xenos)); "
              "the game will fail to load its GPU plugin")
 
-    configure = ["cmake", "--preset", PRESET, "-DREXGLUE_RECOMP_DEBUG_INFO=full"]
+    configure = ["cmake", "--preset", PRESET, "-DREXGLUE_RECOMP_DEBUG_INFO=full", *cmake_defs]
     cache = ctx.build_dir / "CMakeCache.txt"
     if not cache.exists():
         if subprocess.run(configure).returncode != 0:
             die("initial configure failed")
+    elif cmake_defs:
+        # Apply new -D values before anything (including codegen) is built.
+        if subprocess.run(configure, stdout=subprocess.DEVNULL).returncode != 0:
+            die(f"configure with {' '.join(cmake_defs)} failed")
     # An empty CMAKE_CXX_FLAGS_<CONFIG> in the cache (seen on Ridge after its
     # first configure) silently builds everything at -O0 - several times slower.
     cache_text = cache.read_text(encoding="utf-8", errors="replace")
