@@ -51,6 +51,7 @@ sudo dnf install python3 cmake ninja-build clang git gdb binutils perf renderdoc
 | Performance work | `perf` | Not called by `rex`; see the `perf` commands under Notes |
 | `rex sdk ...` | git | The SDK must be a git checkout (patch status / apply / export) |
 | `rex dist` | podman (preferred) or docker | Pulls `registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk` by default. Everything else (clang, cmake, ninja) comes from the image |
+| `rex wasm ...`, `rex dawn ...` | emsdk (the version the SDK pins, see its `docs/WASM.md`); for `rex dawn` the SDK's Dawn download (configure with WebGPU on); for `rex wasm dawn` npm (comes with emsdk's node) | `rex wasm dawn` installs Dawn for node (`webgpu` npm package, ~140 MB) into the SDK's `out/deps` on first use. All of it needs the SDK's `wasm` branch |
 
 Not needed: Pillow, a standalone `renderdoc` Python module, `bc`, or any
 Python packages. `py/pngcrop.py` covers cropping PNGs without PIL.
@@ -126,6 +127,12 @@ rex triage 120 --hang-dump         # if it then shows a black screen / stalls
 | `rex modules` | the project's binaries (entrypoint + `[[modules]]` DLLs): address range, generated dir, functions file |
 | `rex clean-shm` | removes leaked `/dev/shm/xenia_memory_*` (4.5GB each; a full tmpfs causes SIGBUS) |
 | `rex dist [--config C] [--march M] [--image I] [--no-pull] [--shell]` | builds SDK + project inside a Steam Runtime SDK container and packages `dist/<name>-<tag>/` (+ `.tar.gz`): exe, its SDK libs, `<name>.toml` defaults, empty `game/`, README for testers |
+| `rex wasm build [--web] [--force-codegen] [-DNAME=VALUE...]` | WebAssembly build with the SDK in-tree: `out/build/wasm64` for node, or with `--web` `out/build/wasm64-web` for the browser, with the game folder packaged into `<name>.data` (loaded by the page, mounted at `/game`; small games only for now). Codegen uses `$REX_HOST_REXGLUE`, else the newer of the SDK build tree's and install's `rexglue` |
+| `rex wasm run [args]` | the node build under emsdk's node: null GPU, headless, log in `out/build/wasm64/logs/` |
+| `rex wasm dawn [args]` | the node build with Dawn's WebGPU for node, the null GPU's wireframes going through the WebGPU presenter (no window: node has no canvas) |
+| `rex wasm browser [args]` | serves the `--web` build cross-origin isolated (emrun) and opens it in the default browser; the page's log comes back to the terminal; Ctrl-C stops it. Without WebGPU (Firefox on Linux, unless `dom.webgpu.enabled` and `dom.webgpu.workers.enabled` are set) it presents in software |
+| `rex dawn build [-DNAME=VALUE...]` | native build with WebGPU (Dawn) and the SDK in-tree, in `out/build/<preset>-dawn` |
+| `rex dawn run [args]` | runs it with the null GPU presenting through WebGPU; on Linux in an X11 window (the prebuilt Dawn has no Wayland) |
 | `rex sdk check` | are the installed SDK libs newer than their sources? local patch status |
 | `rex sdk patches status\|apply\|export` | local SDK fixes kept as `sdk-patches/*.patch` |
 

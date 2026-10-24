@@ -22,6 +22,10 @@ recompilation projects. Run from anywhere inside a project directory.
   rex modules                              binaries (exe + DLLs), ranges, functions tables
   rex clean-shm [--dry-run]                remove leaked /dev/shm guest memory (Linux)
   rex dist [--config C] [--march M]        portable build via Steam Runtime SDK container (Linux)
+  rex wasm build [--web] [-DNAME=VAL]      WebAssembly build (node, or --web for the browser)
+  rex wasm run|dawn|browser [game args...] under node / node with Dawn's WebGPU / the
+                                           default browser (rex wasm help)
+  rex dawn build|run [...]                 native build with WebGPU (Dawn), and run it
   rex sdk check                            is the installed SDK current?
   rex sdk patches status|apply             local SDK patches (sdk-patches/)
   rex sdk patches export <name> <file>...  save SDK changes as a patch
@@ -65,6 +69,9 @@ def dispatch(cmd: str, args: list[str]) -> int:
     if cmd in ("crash", "hang", "peek"):
         from rexcli import debug
         return getattr(debug, f"cmd_{cmd}")(args)
+    if cmd in ("wasm", "dawn"):
+        from rexcli import wasm
+        return getattr(wasm, f"cmd_{cmd}")(args)
     if cmd in ("log", "clean-shm", "sdk", "rdc", "dist"):
         from rexcli import misc
         return getattr(misc, f"cmd_{cmd.replace('-', '_')}")(args)
