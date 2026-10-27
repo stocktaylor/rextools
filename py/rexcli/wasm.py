@@ -6,12 +6,14 @@ its parent) and the SDK in-tree (REXSDK_DIR), as there is no packaged wasm SDK.
 Codegen still runs natively, through a rexglue built from the same SDK sources:
 $REX_HOST_REXGLUE, else the newer of the SDK's build tree and install ones.
 
-  rex wasm build [--web] [--force-codegen] [-DNAME=VAL]
+  rex wasm build [--web [--package-data]] [--force-codegen] [-DNAME=VAL]
       out/build/wasm64: runs under node, reading the game folder from disk.
-      --web: out/build/wasm64-web, for the browser, with the game folder
-      packaged into <name>.data, which the page loads before the game and
-      mounts at /game (Emscripten's file_packager), so only for small games
-      until the SDK can stream data.
+      --web: out/build/wasm64-web, for the browser. The page asks the user for
+      the game folder on their disk and the game reads it in place, any size
+      (the SDK's BrowserFileDevice; on Chromium the folder is remembered).
+      --package-data instead packages the game folder into <name>.data, which
+      the page loads before the game and mounts at /game (Emscripten's
+      file_packager): no picker, for small games and headless tests.
       -D options go to CMake (cached), e.g. -DBLADE_LAUNCHER=OFF.
   rex wasm run [game args...]       under node, null GPU, headless
   rex wasm dawn [game args...]      under node with Dawn's WebGPU (the `webgpu`
@@ -140,19 +142,141 @@ def wasm_build_dir(ctx: Ctx, web: bool) -> Path:
     return ctx.dir / "out" / "build" / ("wasm64-web" if web else "wasm64")
 
 
+# The page: the canvas, and the game data either packaged (<name>.data.js,
+# `--package-data`) or picked by the user from a folder on their disk, read
+# where the game reads it (the SDK's BrowserFileDevice). @NAME@ and @DATA@ are
+# replaced.
 WEB_PAGE = """<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>{name}</title>
-<style>html, body {{ margin: 0; height: 100%; background: #000; }}
-canvas {{ display: block; width: 100vw; height: 100vh; }}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@NAME@</title>
+<style>
+html, body { margin: 0; height: 100%; background: #000; color: #e8e8e8;
+  font: 16px/1.5 system-ui, sans-serif; }
+canvas { display: block; width: 100vw; height: 100vh; }
+#picker { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: #000; }
+#picker[hidden] { display: none; }
+#picker > div { max-width: 32rem; padding: 0 16px; }
+#picker h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
+#picker p { color: #aaa; margin: 0 0 1rem; }
+#picker button { font: inherit; padding: 0.5rem 1rem; margin: 0 0.5rem 0.5rem 0; cursor: pointer;
+  border: 1px solid #555; border-radius: 6px; background: #222; color: inherit; }
+#picker button:hover { background: #333; }
+#status { min-height: 1.5em; color: #f0b060; }
+</style>
 </head>
 <body>
 <canvas id="canvas" tabindex="-1"></canvas>
-<script>var Module = {{ canvas: document.getElementById("canvas") }};</script>
-<script src="{name}.data.js"></script>
-<script src="{name}.js"></script>
+<div id="picker" hidden>
+  <div>
+    <h1>@NAME@</h1>
+    <p>Choose the game's folder (the one with <code>default.xex</code>). Its files are read from
+    your disk as the game needs them; nothing is uploaded or copied.</p>
+    <button id="resume" hidden></button><button id="choose">Choose folder...</button>
+    <input id="folder" type="file" webkitdirectory hidden>
+    <p id="status"></p>
+  </div>
+</div>
+<script>
+var Module = { canvas: document.getElementById("canvas") };
+(() => {
+  if (@DATA@) {
+    return;
+  }
+  Module.rexWaitForGameFiles = true;
+  const picker = document.getElementById("picker");
+  const status = document.getElementById("status");
+  const resume = document.getElementById("resume");
+  picker.hidden = false;
+
+  // [{path, file}] relative to the folder holding default.xex, which may be
+  // the picked folder or one inside it.
+  function useFiles(entries) {
+    const xex = entries.map((e) => e.path).filter((p) => /(^|\\/)default\\.xex$/i.test(p))
+        .sort((a, b) => a.length - b.length)[0];
+    if (xex === undefined) {
+      status.textContent = "That folder has no default.xex. Choose the game's folder.";
+      return;
+    }
+    const prefix = xex.slice(0, xex.length - "default.xex".length);
+    const files = entries.filter((e) => e.path.startsWith(prefix))
+        .map((e) => ({ path: e.path.slice(prefix.length), file: e.file }));
+    picker.hidden = true;
+    Module.canvas.focus();
+    Module.rexSetGameFiles(files);
+  }
+
+  // Chromium: a directory handle, remembered for the next visit.
+  async function walk(handle, prefix, out) {
+    for await (const [name, child] of handle.entries()) {
+      if (child.kind === "directory") {
+        await walk(child, prefix + name + "/", out);
+      } else {
+        out.push({ path: prefix + name, file: await child.getFile() });
+      }
+    }
+    return out;
+  }
+  function store(mode, handle) {
+    return new Promise((resolve) => {
+      const open = indexedDB.open("rex-game-folder", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore("handles");
+      open.onerror = () => resolve(undefined);
+      open.onsuccess = () => {
+        const tx = open.result.transaction("handles", mode);
+        const req = mode === "readwrite" ? tx.objectStore("handles").put(handle, "@NAME@")
+                                         : tx.objectStore("handles").get("@NAME@");
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(undefined);
+      };
+    });
+  }
+  async function useHandle(handle) {
+    status.textContent = "Reading the folder...";
+    useFiles(await walk(handle, "", []));
+  }
+  if (window.showDirectoryPicker) {
+    store("readonly").then((handle) => {
+      if (!handle) {
+        return;
+      }
+      resume.textContent = "Continue with " + handle.name;
+      resume.hidden = false;
+      resume.onclick = async () => {
+        if (await handle.requestPermission({ mode: "read" }) === "granted") {
+          await useHandle(handle);
+        }
+      };
+    });
+  }
+
+  document.getElementById("choose").onclick = async () => {
+    if (window.showDirectoryPicker) {
+      try {
+        const handle = await window.showDirectoryPicker({ mode: "read" });
+        await store("readwrite", handle);
+        await useHandle(handle);
+      } catch (e) {
+        if (e.name !== "AbortError") {
+          status.textContent = String(e);
+        }
+      }
+      return;
+    }
+    document.getElementById("folder").click();
+  };
+  // Other browsers: every file in the folder, its path starting with the
+  // folder's own name.
+  document.getElementById("folder").onchange = (event) => {
+    useFiles(Array.from(event.target.files, (file) => ({
+      path: file.webkitRelativePath.slice(file.webkitRelativePath.indexOf("/") + 1), file })));
+  };
+})();
+</script>
+@DATA_SCRIPT@<script src="@NAME@.js"></script>
 </body>
 </html>
 """
@@ -160,6 +284,8 @@ canvas {{ display: block; width: 100vw; height: 100vh; }}</style>
 
 def cmd_wasm_build(args: list[str]) -> int:
     ctx = load_project()
+    package_data = "--package-data" in args
+    args = [a for a in args if a != "--package-data"]
     web, force, defs = _parse_build_args(args, allow_web=True)
     emsdk = find_emsdk()
     env = emsdk_env(emsdk)
@@ -169,9 +295,10 @@ def cmd_wasm_build(args: list[str]) -> int:
     if web:
         # The page (WEB_PAGE) hands its canvas to main's pthread, which passes
         # it to the WebGPU device thread; --emrun takes the program's arguments
-        # from the URL and sends its output back to `rex wasm browser`. The game
-        # data is packaged separately (_package_game_data), whose loader needs
-        # the file system API exported.
+        # from the URL and sends its output back to `rex wasm browser`. Game
+        # data is picked by the user in the page, or with --package-data
+        # packaged separately (_package_game_data), whose loader needs the file
+        # system API exported.
         link += " -sOFFSCREENCANVAS_SUPPORT -sFORCE_FILESYSTEM --emrun"
         extra = ["-DREXGLUE_WASM_NODE=OFF"]
     configure = [
@@ -188,8 +315,16 @@ def cmd_wasm_build(args: list[str]) -> int:
     note(f"building {build_dir.relative_to(ctx.dir)} (codegen with {host_rexglue()})")
     _build(ctx, build_dir, configure, env, force)
     if web:
-        _package_game_data(ctx, build_dir, emsdk, env)
-        (build_dir / f"{ctx.name}.html").write_text(WEB_PAGE.format(name=ctx.name), encoding="utf-8")
+        data_script = ""
+        if package_data:
+            _package_game_data(ctx, build_dir, emsdk, env)
+            data_script = f'<script src="{ctx.name}.data.js"></script>\n'
+        else:
+            for stale in (build_dir / f"{ctx.name}.data", build_dir / f"{ctx.name}.data.js"):
+                stale.unlink(missing_ok=True)
+        page = (WEB_PAGE.replace("@DATA_SCRIPT@", data_script)
+                .replace("@DATA@", "true" if package_data else "false").replace("@NAME@", ctx.name))
+        (build_dir / f"{ctx.name}.html").write_text(page, encoding="utf-8")
         note(f"page: {build_dir / f'{ctx.name}.html'} (run it with `rex wasm browser`)")
     return 0
 
