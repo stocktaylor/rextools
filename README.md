@@ -116,6 +116,7 @@ rex triage 120 --hang-dump         # if it then shows a black screen / stalls
 | `rex peek [--func sub_X] [--thread T] [--addrs A,B]` | attaches to the running game: one guest thread's PPC registers (from `ctx`), its stack frame, and the header + contents of everything those point at. For seeing what a spinning loop is testing |
 | `rex log [run#]` | one run's log with its rotated 5MB segments merged |
 | `rex run --renderdoc [args]` | run under RenderDoc; F12 saves a frame to `_tools/captures/`, empty captures flagged afterwards |
+| `rex xenia [--renderdoc] [args]` | runs the reference emulator, `<project>/xenia/xenia_edge`, on the manifest's `[entrypoint]` XEX (from the `xenia/` folder, with its bundled libs first); `--renderdoc` captures to `_tools/captures/xenia_*` for `rex rdc align` |
 | `rex rdc list` | captures with sizes; flags likely-empty ones |
 | `rex rdc dump <cap.rdc> [--events a,b]` | headless replay via `qrenderdoc --python`: action tree, render-target PNGs; per event: constants, post-VS outputs, textures, blend, SPIR-V |
 | `rex rdc align <dumpA> <dumpB>` | match passes and draws between two captures (e.g. recomp vs Xenia) by draw sequence |
@@ -261,6 +262,12 @@ Local fixes to rexglue-sdk v0.10.0, all found bringing up Ridge Racer 6:
 
 | `d3d12-shared-memory-typed-views` | Windows on Snapdragon (Adreno X1-85): every game rendered black, though the guest ran normally at 60 fps. The Qualcomm D3D12 driver mishandles raw (`ByteAddressBuffer`) views larger than 256 MB: a 512 MB raw SRV returns wrong data everywhere and a raw UAV wraps at 2^28 bytes (typed views of any size, and raw views of at most 256 MB, are fine). Shared memory is one 512 MB raw view, so vertex fetch read garbage and memexport wrote to the wrong place. Translated shaders now access shared memory through R32_UINT typed views (one load/store per dword, atomics by dword index) when the adapter is Qualcomm (vendor `0x5143` or `0x4D4F4351` "QCOM"), or with `--d3d12_shared_memory_typed_views=true`; other GPUs keep raw views |
 
+| `gpu-register-write-fast-path` | GTA IV ran below 60 fps with the PC mostly idle: the GPU command thread was pinned at ~90% of a core and the game's main and render threads spun in D3D's ring-buffer-space wait behind it. About 35% of that thread went to register writes. `CommandProcessor::WriteRegister` called `RegisterFile::GetRegisterInfo` (a ~3400-case switch) on every write only to decide whether to debug-log an unknown register; now a compile-time bitmap of known registers. Type-0 packets also wrote sequential registers one call at a time; they now go through `WriteRegisterRangeFromRing` like `SET_CONSTANT`, so backends copy shader constants in bulk and invalidate once per range (Liberty, GTA IV) |
+
+| `memexport-readback-check-order` | `IsReadbackMemexportEnabled` looks a legacy cvar up by name (registry lock, string allocation, hash lookup, value formatting) and `IssueDraw` called it for every draw, ~4% of the GPU command thread in GTA IV. Vulkan and D3D12 now test that the draw has memexport ranges first; behaviour is unchanged |
+
+| `procmap-query-protect` | The write-watch fault handler (`MMIOHandler`) calls `QueryProtect` on the faulting page while holding the global critical region. On Linux that read and `sscanf`'d all of `/proc/self/maps`, thousands of lines once per-page protection has split the mappings, so every guest write to a GPU-uploaded page held up the GPU command thread's `SharedMemory::RequestRanges` (~8% of it in lock/unlock, plus unsampled kernel time). Now uses the `PROCMAP_QUERY` ioctl (Linux 6.11+) to look up one address in the kernel's VMA tree, falling back to the text parse on older kernels; the struct is defined locally for older headers (Steam Runtime) (Liberty, GTA IV) |
+
 After `rex sdk patches apply`, install both configs:
 `cmake --build --preset linux-amd64-release --target install` and
 `cmake --build --preset linux-amd64-relwithdebinfo --target install`.
@@ -312,9 +319,7 @@ Roughly in priority order.
    - host-thread callbacks into guest code: list the XHostThread-dispatched
      guest entry points, which need the FPSCR patch.
 5. **RenderDoc follow-ups.** The core is done (`rex run --renderdoc`, `rex rdc`).
-   Still to do: a helper for capturing a *reference* emulator (Xenia) the
-   same way, which today means running `renderdoccmd capture` by hand, and
-   `rex rdc diff` printing the exact SPIR-V lines that differ around texture
+   Still to do: `rex rdc diff` printing the exact SPIR-V lines that differ around texture
    fetches, not just a summary.
 6. **Save/content inspection.** `rex saves` lists what the game created under
    the user data root (`~/.local/share/<name>/content/...`), with headers

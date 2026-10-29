@@ -6,6 +6,7 @@ recompilation projects. Run from anywhere inside a project directory.
                                            -D options go to CMake (cached)
   rex run [game args...]                   run the game with standard flags
   rex run --renderdoc [game args...]       run under RenderDoc (F12 captures a frame)
+  rex xenia [--renderdoc] [xenia args...]  run xenia/xenia_edge on the manifest's XEX
   rex triage [timeout] [--hang-dump]       build/run loop: auto-add missing
                                            functions, stop on anything else
   rex lint [--all]                         scan generated code for misreads
@@ -63,7 +64,7 @@ def dispatch(cmd: str, args: list[str]) -> int:
     if IS_WINDOWS and cmd in WINDOWS_UNSUPPORTED:
         die(WINDOWS_UNSUPPORTED[cmd])
 
-    if cmd in ("new", "build", "run", "triage"):
+    if cmd in ("new", "build", "run", "triage", "xenia"):
         from rexcli import build
         return getattr(build, f"cmd_{cmd}")(args)
     if cmd in ("crash", "hang", "peek"):

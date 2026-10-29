@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .common import (IS_WINDOWS, PRESET, REXGLUE_BIN, SDK_LIB, Ctx, append_function, die,
+from .common import (EXE_SUFFIX, IS_WINDOWS, PRESET, REXGLUE_BIN, SDK_LIB, Ctx, append_function, die,
                      env_with_sdk_libs, helper, latest_run_number, load_project, mtime, note,
                      rex_subcommand, run_log_bytes, sdk_lib_file, sync_gpu_plugin)
 
@@ -151,7 +151,9 @@ def cmd_build(args: list[str]) -> int:
 
     configure = ["cmake", "--preset", PRESET, "-DREXGLUE_RECOMP_DEBUG_INFO=full", *cmake_defs]
     cache = ctx.build_dir / "CMakeCache.txt"
-    if not cache.exists():
+    # A failed first configure leaves CMakeCache.txt but no build.ninja; treat
+    # that as unconfigured, or the codegen step dies with a bare ninja error.
+    if not cache.exists() or not (ctx.build_dir / "build.ninja").exists():
         if subprocess.run(configure).returncode != 0:
             die("initial configure failed")
     elif cmake_defs:
@@ -275,6 +277,35 @@ def game_command(ctx: Ctx, user_args: list[str]) -> tuple[list[str], dict]:
     return [str(ctx.bin), *defaults, *user_args], env_with_sdk_libs()
 
 
+def _run_under_renderdoc(ctx: Ctx, argv: list[str], env: dict, prefix: str, cwd: Path) -> int:
+    """Runs argv under renderdoccmd, capturing into _tools/captures/<prefix>_*,
+    then lists the captures this run took (flagging empty ones)."""
+    import shutil
+    if not shutil.which("renderdoccmd"):
+        die("renderdoccmd not found (install RenderDoc and put it on PATH)")
+    cap_dir = ctx.dir / "_tools" / "captures"
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    print("Running under RenderDoc - press F12 in game to capture a frame.", flush=True)
+    if not IS_WINDOWS:
+        env["SDL_VIDEO_DRIVER"] = "x11"  # RenderDoc has no Wayland support
+    capture_file = cap_dir / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}"
+    subprocess.run(["renderdoccmd", "capture", "--working-dir", str(cwd),
+                    "--capture-file", str(capture_file), *argv], env=env)
+    print()
+    new = sorted(p.name for p in cap_dir.glob("*.rdc") if p.stat().st_mtime >= started)
+    if not new:
+        print("No captures taken.")
+    else:
+        from .misc import rdc_list_lines
+        print("Captures from this run:")
+        for line in rdc_list_lines(cap_dir):
+            if any(n in line for n in new):
+                print(line)
+        print("Next: rex rdc dump <capture.rdc>")
+    return 0
+
+
 def cmd_run(args: list[str]) -> int:
     ctx = load_project()
     if not ctx.bin.is_file():
@@ -285,33 +316,47 @@ def cmd_run(args: list[str]) -> int:
     argv, env = game_command(ctx, user_args)
 
     if renderdoc:
-        import shutil
-        if not shutil.which("renderdoccmd"):
-            die("renderdoccmd not found (install RenderDoc and put it on PATH)")
         if (os.environ.get("REX_PRESENT") or "vsync") != "vsync":
             note("warning: REX_PRESENT=uncapped makes most captures empty")
-        cap_dir = ctx.dir / "_tools" / "captures"
-        cap_dir.mkdir(parents=True, exist_ok=True)
-        started = time.time()
-        print("Running under RenderDoc - press F12 in game to capture a frame.", flush=True)
-        if not IS_WINDOWS:
-            env["SDL_VIDEO_DRIVER"] = "x11"  # RenderDoc has no Wayland support
-        capture_file = cap_dir / f"{ctx.name}_{datetime.now():%Y%m%d_%H%M%S}"
-        subprocess.run(["renderdoccmd", "capture", "--working-dir", str(ctx.dir),
-                        "--capture-file", str(capture_file), *argv], env=env)
-        print()
-        new = sorted(p.name for p in cap_dir.glob("*.rdc") if p.stat().st_mtime >= started)
-        if not new:
-            print("No captures taken.")
-        else:
-            from .misc import rdc_list_lines
-            print("Captures from this run:")
-            for line in rdc_list_lines(cap_dir):
-                if any(n in line for n in new):
-                    print(line)
-            print("Next: rex rdc dump <capture.rdc>")
-        return 0
+        return _run_under_renderdoc(ctx, argv, env, ctx.name, ctx.dir)
 
+    return _exec(argv, env)
+
+
+# --------------------------------------------------------------------------
+# rex xenia [--renderdoc] [xenia args...]
+# Runs the reference emulator on the project's XEX (the manifest's
+# [entrypoint] file_path): <project>/xenia/xenia_edge, started from that
+# folder (so its config, log and portable data stay there) with that folder
+# first on the library path (the SDL it ships with). --renderdoc captures
+# into _tools/captures/xenia_* like `rex run --renderdoc`, for
+# `rex rdc align` against the recomp.
+
+def cmd_xenia(args: list[str]) -> int:
+    ctx = load_project()
+    xenia_dir = ctx.dir / "xenia"
+    exe = xenia_dir / f"xenia_edge{EXE_SUFFIX}"
+    if not exe.is_file():
+        die(f"no Xenia at {exe}")
+    xex = ctx.project.modules[0].xex
+    if not xex.is_file():
+        die(f"no XEX at {xex} (the manifest's [entrypoint] file_path)")
+    renderdoc = "--renderdoc" in args
+    argv = [str(exe), *[a for a in args if a != "--renderdoc"], str(xex)]
+    env = dict(os.environ)
+    if not IS_WINDOWS:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            p for p in (str(xenia_dir), env.get("LD_LIBRARY_PATH")) if p)
+    os.chdir(xenia_dir)
+
+    if renderdoc:
+        return _run_under_renderdoc(ctx, argv, env, "xenia", xenia_dir)
+
+    return _exec(argv, env)
+
+
+def _exec(argv: list[str], env: dict) -> int:
+    """Replaces this process with argv (Windows: runs it and waits)."""
     sys.stdout.flush()
     if IS_WINDOWS:
         # No real exec on Windows: wait for the game and pass on its exit code.
